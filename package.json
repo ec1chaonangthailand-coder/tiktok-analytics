@@ -1,0 +1,8 @@
+{
+  "name": "tiktok-analytics",
+  "version": "1.0.0",
+  "private": true,
+  "description": "แดชบอร์ดวิเคราะห์ร้าน TikTok Shop (Seller Center + Affiliate Center) ข้อมูลจริงผ่าน session cookie — ไม่ใช้ไลบรารีภายนอก",
+  "scripts": { "start": "node src/server.js" },
+  "engines": { "node": ">=18" }
+}

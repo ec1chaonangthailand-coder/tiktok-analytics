@@ -1,0 +1,21 @@
+# Deploy บน Render (Web Service, free plan) — https://render.com
+services:
+  - type: web
+    name: tiktok-analytics
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node src/server.js
+    envVars:
+      - key: APP_PASSWORD
+        sync: false   # ตั้งค่าใน Render Dashboard: รหัสผ่านเข้าเว็บสำหรับทีม
+      - key: APP_USER
+        value: admin
+      - key: APP_SECRET
+        generateValue: true
+      - key: TIKTOK_COOKIE
+        sync: false   # cookie ของ seller-th.tiktok.com (ทั้งบรรทัด Cookie จาก DevTools)
+      - key: TIKTOK_AFFILIATE_COOKIE
+        sync: false   # cookie ของ affiliate.tiktok.com (ไม่บังคับ)
+      - key: TIKTOK_SHOP_ID
+        sync: false   # shop id เช่น 7494676642014661622 (จำเป็นเมื่อใช้ TIKTOK_COOKIE)
