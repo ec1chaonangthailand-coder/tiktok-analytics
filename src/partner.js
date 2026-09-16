@@ -298,12 +298,50 @@ function aggregateAffiliate(orders) {
   };
 }
 
+// แปลงให้ชื่อฟิลด์ตรงกับที่หน้าเว็บเดิม (public/app.js) ใช้อยู่ จะได้ไม่ต้องแก้ฝั่งหน้าเว็บ
+function toLegacyShape(agg, orders, start, end, meta) {
+  const latest = orders.reduce((mx, o) => (o.create_time > mx ? o.create_time : mx), 0);
+  const creators = agg.creators.map((c) => ({
+    handle: c.creator, nickname: c.creator, followers: null,
+    gmv: c.gmv, orders_cnt: c.orders, items_sold_cnt: c.items, estimated_commission: c.commission,
+    video_cnt: null, live_cnt: null, video_gmv: null, live_gmv: null, refunded_gmv: null,
+  }));
+  const list = [];
+  for (const o of orders) {
+    for (const s of o.skus || []) {
+      list.push({
+        main_order_id: o.id, create_time: o.create_time,
+        creator: s.creator_username || "", creator_nickname: s.creator_username || "",
+        product: s.product_id || "", qty: Number(s.quantity || 0),
+        sale_price: money(s.price),
+        commission_rate: s.commission_rate ? `${Number(s.commission_rate) / 100}%` : (s.commission_model || ""),
+        commission: money(s.estimated_paid_commission),
+        settlement_status: s.settlement_status || "",
+      });
+      if (list.length >= 500) break;
+    }
+    if (list.length >= 500) break;
+  }
+  return {
+    range: { start, end }, source: "partner_api",
+    available_until: latest ? ymdBangkok(latest) : end,
+    totals: agg.totals, daily: agg.daily,
+    creators, total_creators: agg.creators.length, creators_error: null,
+    collaboration: agg.by_content_type.map((t) => ({ collaboration_type: t.content_type, gmv: t.gmv })),
+    orders: { total: orders.length, list, error: null },
+    by_content_type: agg.by_content_type, settlement_status: agg.settlement_status,
+    products: agg.products,
+    api_total_sku_lines: meta.total_count, fetched_orders: orders.length, pages: meta.pages, truncated: meta.truncated,
+    note_missing_metrics: "CTR สินค้า / คลิก→ออเดอร์ / จำนวนผู้ซื้อ / ครีเอเตอร์ที่โปรโมท / จำนวนวิดีโอ-LIVE / ตัวอย่างที่ส่ง ไม่มีใน Partner API จึงแสดงเป็น – ไม่ใช่ 0",
+  };
+}
+
 async function affiliateRangePartner(start, end) {
   const cipher = (await shops())[0]?.cipher;
   if (!cipher) throw new PartnerError("ไม่พบร้านที่อนุญาตแล้ว", "/authorization/202309/shops", 0, null);
-  const { orders, total_count, pages, truncated } = await affiliateOrders(start, end, cipher);
-  const agg = aggregateAffiliate(orders);
-  return { range: { start, end }, source: "partner_api", api_total_count: total_count, fetched_orders: orders.length, pages, truncated, ...agg };
+  const meta = await affiliateOrders(start, end, cipher);
+  const agg = aggregateAffiliate(meta.orders);
+  return toLegacyShape(agg, meta.orders, start, end, meta);
 }
 
 async function affiliateWithCompare(p) {
