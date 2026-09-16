@@ -42,11 +42,21 @@ function sign(pathname, query, bodyString) {
   return crypto.createHmac("sha256", APP_SECRET).update(wrapped).digest("hex");
 }
 
+// เก็บ token 3 ชั้น: หน่วยความจำ (เร็วสุด) → ไฟล์ (รอดข้าม process แต่ไม่รอด deploy) → env (ถาวร)
+let MEM = null;
+const ENV_REFRESH = (process.env.TTS_REFRESH_TOKEN || "").trim();
+const ENV_ACCESS = (process.env.TTS_ACCESS_TOKEN || "").trim();
+const fingerprint = (v) => (v ? crypto.createHash("sha256").update(String(v)).digest("hex").slice(0, 12) : null);
+
 function readTokens() {
-  try { return JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8")); } catch { return null; }
+  if (MEM) return MEM;
+  try { MEM = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8")); return MEM; } catch { /* ไม่มีไฟล์ */ }
+  if (ENV_REFRESH || ENV_ACCESS) { MEM = { access_token: ENV_ACCESS || "", refresh_token: ENV_REFRESH || "", source: "env", saved_at: null }; return MEM; }
+  return null;
 }
 function writeTokens(t) {
-  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(TOKEN_FILE, JSON.stringify(t, null, 2)); } catch { /* ephemeral disk — ไม่เป็นไร */ }
+  MEM = t;
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(TOKEN_FILE, JSON.stringify(t, null, 2)); } catch { /* ดิสก์ชั่วคราวบน Render — เก็บในหน่วยความจำพอ */ }
 }
 
 async function jsonFetch(url, opt, endpoint) {
@@ -91,15 +101,37 @@ async function refresh() {
   const { res, j } = await jsonFetch(url, { method: "GET", headers: { accept: "application/json" } }, p);
   if (j.code !== 0) throw new PartnerError(`รีเฟรช token ไม่สำเร็จ code=${j.code}: ${j.message || ""}`, p, res.status, j.code);
   const d = j.data || {};
-  writeTokens({ ...t, access_token: d.access_token, refresh_token: d.refresh_token || t.refresh_token, access_token_expire_in: d.access_token_expire_in, refresh_token_expire_in: d.refresh_token_expire_in, saved_at: new Date().toISOString() });
-  return { refreshed: true, access_token_expire_in: d.access_token_expire_in };
+  const rotated = !!(d.refresh_token && d.refresh_token !== t.refresh_token);
+  writeTokens({ ...t, source: "refresh", access_token: d.access_token, refresh_token: d.refresh_token || t.refresh_token, access_token_expire_in: d.access_token_expire_in, refresh_token_expire_in: d.refresh_token_expire_in, saved_at: new Date().toISOString() });
+  return {
+    refreshed: true,
+    used_refresh_token_from: t.source || "file",
+    refresh_token_rotated: rotated,
+    old_refresh_fingerprint: fingerprint(t.refresh_token),
+    new_refresh_fingerprint: fingerprint(d.refresh_token || t.refresh_token),
+    access_token_expire_at: d.access_token_expire_in ? new Date(d.access_token_expire_in * 1000).toISOString() : null,
+    refresh_token_expire_at: d.refresh_token_expire_in ? new Date(d.refresh_token_expire_in * 1000).toISOString() : null,
+  };
 }
 
-function accessToken() {
-  const envTok = (process.env.TTS_ACCESS_TOKEN || "").trim();
-  if (envTok) return envTok;
-  const t = readTokens();
-  if (!t || !t.access_token) throw new PartnerError("ยังไม่มี access_token — ต้องอนุญาตร้านค้าก่อน (ttsAuthUrl → ttsExchange)", "-", 0, null);
+const SAFETY = 6 * 3600; // รีเฟรชล่วงหน้า 6 ชม.
+function tokenExpired(t) {
+  if (!t || !t.access_token) return true;
+  if (!t.access_token_expire_in) return false; // ไม่รู้วันหมดอายุ ก็ลองใช้ไปก่อน
+  return Math.floor(Date.now() / 1000) > Number(t.access_token_expire_in) - SAFETY;
+}
+// คืน access token ที่ใช้ได้ — รีเฟรชอัตโนมัติถ้าหมดอายุหรือมีแต่ refresh_token (เช่นหลัง deploy ใหม่)
+async function accessToken() {
+  let t = readTokens();
+  if (!t || (!t.access_token && !t.refresh_token)) {
+    throw new PartnerError("ยังไม่มี access_token — ต้องอนุญาตร้านค้าก่อน (ttsAuthUrl → กดอนุญาต)", "-", 0, null);
+  }
+  if (tokenExpired(t)) {
+    if (!t.refresh_token) throw new PartnerError("access_token หมดอายุและไม่มี refresh_token — ต้องอนุญาตร้านค้าใหม่", "-", 0, null);
+    await refresh();
+    t = readTokens();
+  }
+  if (!t.access_token) throw new PartnerError("ไม่มี access_token หลังรีเฟรช", "-", 0, null);
   return t.access_token;
 }
 
@@ -112,7 +144,7 @@ async function call(pathname, { method = "GET", query = {}, body = null, withTok
   q.sign = sign(pathname, q, bodyString);
   const qs = Object.entries(q).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
   const headers = { "content-type": "application/json", accept: "application/json" };
-  if (withToken) headers["x-tts-access-token"] = accessToken();
+  if (withToken) headers["x-tts-access-token"] = await accessToken();
   const { res, j } = await jsonFetch(`${API_BASE}${pathname}?${qs}`, { method, headers, body: bodyString || undefined }, pathname);
   if (j.code !== 0) throw new PartnerError(`TikTok Open API error code=${j.code}: ${j.message || ""}`, pathname, res.status, j.code);
   return { data: j.data, request_id: j.request_id };
@@ -181,7 +213,26 @@ async function handlePartner(action, p) {
   switch (action) {
     case "ttsStatus": {
       const t = readTokens();
-      return { app_key_set: !!APP_KEY, app_secret_set: !!APP_SECRET, service_id_set: !!SERVICE_ID, api_base: API_BASE, has_token: !!(t && t.access_token) || !!(process.env.TTS_ACCESS_TOKEN || "").trim(), token_saved_at: t ? t.saved_at : null, seller_name: t ? t.seller_name : null };
+      const now = Math.floor(Date.now() / 1000);
+      return {
+        app_key_set: !!APP_KEY, app_secret_set: !!APP_SECRET, service_id_set: !!SERVICE_ID, api_base: API_BASE,
+        has_access_token: !!(t && t.access_token), has_refresh_token: !!(t && t.refresh_token),
+        token_source: t ? (t.source || "file") : "none",
+        env_refresh_token_set: !!ENV_REFRESH,
+        access_token_expire_at: t && t.access_token_expire_in ? new Date(t.access_token_expire_in * 1000).toISOString() : null,
+        access_token_days_left: t && t.access_token_expire_in ? Math.round(((t.access_token_expire_in - now) / 86400) * 10) / 10 : null,
+        refresh_token_expire_at: t && t.refresh_token_expire_in ? new Date(t.refresh_token_expire_in * 1000).toISOString() : null,
+        refresh_token_days_left: t && t.refresh_token_expire_in ? Math.round(((t.refresh_token_expire_in - now) / 86400) * 10) / 10 : null,
+        refresh_token_fingerprint: t ? fingerprint(t.refresh_token) : null,
+        token_saved_at: t ? t.saved_at : null, seller_name: t ? t.seller_name : null,
+      };
+    }
+    // เรียก endpoint ใด ๆ ของ Open API ตรง ๆ (ใช้สำรวจโครงสร้าง response ก่อนเขียนหน้าเว็บ)
+    case "ttsRaw": {
+      if (!p.path) throw new PartnerError("ต้องระบุ path เช่น /analytics/202509/shop/performance", "-", 0, null);
+      const cipher = p.shop_cipher === false ? null : (p.shop_cipher || (await shops())[0]?.cipher || null);
+      const r = await call(p.path, { method: p.method || "GET", query: p.query || {}, body: p.body || null, shopCipher: cipher });
+      return { path: p.path, request_id: r.request_id, data: r.data };
     }
     case "ttsAuthUrl": return { url: authUrl(p.state) };
     case "ttsExchange": return await exchangeCode(p.auth_code || p.code);
@@ -192,4 +243,9 @@ async function handlePartner(action, p) {
   }
 }
 
-module.exports = { handlePartner, exchangeCode, PartnerError };
+function refreshTokenForDisplay() {
+  const t = readTokens();
+  return t ? (t.refresh_token || "") : "";
+}
+
+module.exports = { handlePartner, exchangeCode, refreshTokenForDisplay, PartnerError };

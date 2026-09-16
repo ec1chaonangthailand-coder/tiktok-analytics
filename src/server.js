@@ -76,6 +76,15 @@ const server = http.createServer(async (req, res) => {
         return send(res, 502, page("แลก token ไม่สำเร็จ", `${e.message}\nendpoint: ${e.endpoint || "-"}\nhttp: ${e.http_status || "-"}\ncode: ${e.code ?? "-"}`), MIME[".html"]);
       }
     }
+    // ---- หน้าแสดง refresh token ให้ผู้ใช้คัดลอกไปใส่เป็น env var (ล็อกอินก่อนถึงจะเข้าได้) ----
+    if (url.pathname === "/token" && isAuthed(req)) {
+      const tok = require("./partner").refreshTokenForDisplay();
+      const body = tok
+        ? `<p>คัดลอกค่าข้างล่างนี้ไปใส่เป็น Environment Variable ชื่อ <code>TTS_REFRESH_TOKEN</code> บน Render แล้วกด Save<br><small>เก็บเป็นความลับเหมือนรหัสผ่าน อย่าแชร์ใคร</small></p><textarea id="t" readonly style="width:100%;height:120px;font-family:monospace;font-size:12px">${tok}</textarea><p><button class="primary" onclick="document.getElementById('t').select();document.execCommand('copy');this.textContent='คัดลอกแล้ว'">คัดลอก</button></p>`
+        : `<p>ยังไม่มี refresh token — ต้องกดอนุญาตร้านค้าก่อน</p>`;
+      const html = `<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Refresh token</title><link rel="stylesheet" href="/app.css"></head><body><main style="max-width:720px;margin:48px auto"><div class="card"><h2>TikTok Partner API — refresh token</h2>${body}<p><a href="/">กลับหน้าแอป</a></p></div></main></body></html>`;
+      return send(res, 200, html, MIME[".html"]);
+    }
     if (!isAuthed(req) && url.pathname !== "/app.css") {
       if (url.pathname.startsWith("/api")) return send(res, 401, { ok: false, error: "กรุณาเข้าสู่ระบบ", app_login: true });
       res.writeHead(302, { location: "/login" }); return res.end();
