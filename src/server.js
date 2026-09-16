@@ -94,7 +94,10 @@ const server = http.createServer(async (req, res) => {
       const action = p.action || "status";
       try {
         let data;
-        if (String(action).startsWith("tts")) {
+        // หน้าแอฟฟิลิเอต: ใช้ Partner API ถ้าตั้งค่าไว้ (ข้อมูลเสถียรกว่า cookie) — ถ้าไม่ได้ตั้งค่าค่อยใช้ cookie เดิม
+        if (action === "affiliate" && require("./partner").partnerConfigured() && p.source !== "cookie") {
+          data = await require("./partner").affiliateWithCompare(p);
+        } else if (String(action).startsWith("tts")) {
           data = await require("./partner").handlePartner(action, p);
           if (data === null) throw Object.assign(new Error(`unknown action: ${action}`), { status: 400 });
         } else data = await handle(action, p);

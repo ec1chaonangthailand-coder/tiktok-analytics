@@ -187,12 +187,16 @@ async function selfTest() {
       query: { start_date_ge: ymd(start), end_date_lt: ymd(new Date(end.getTime() + 86400000)), granularity: "ALL", currency: "LOCAL" },
       shopCipher: cipher,
     });
-    const iv = ((r.data && r.data.intervals) || [])[0] || {};
+    const perf = (r.data && (r.data.performance || r.data)) || {};
+    const iv = ((perf.intervals) || [])[0] || {};
     const sales = iv.sales || {};
     return {
       range: [ymd(start), ymd(end)],
       latest_available_date: r.data && r.data.latest_available_date,
-      gmv: sales.gmv && sales.gmv.overall, orders_count: sales.orders_count, items_sold: sales.items_sold,
+      gmv: sales.gmv && sales.gmv.overall ? Number(sales.gmv.overall.amount) : null,
+      gmv_breakdown: ((sales.gmv && sales.gmv.breakdowns) || []).map((b) => ({ type: b.type, amount: Number(b.gmv.amount) })),
+      gross_revenue: sales.gross_revenue && sales.gross_revenue.overall ? Number(sales.gross_revenue.overall.amount) : null,
+      orders_count: sales.orders_count, items_sold: sales.items_sold, refunds: sales.refunds ? Number(sales.refunds.amount) : null,
       request_id: r.request_id,
     };
   });
@@ -207,6 +211,114 @@ async function selfTest() {
   });
 
   return out;
+}
+
+
+// ---------- แอฟฟิลิเอตจาก Partner API (แทน Affiliate Center ที่ต้องใช้ cookie) ----------
+const AFF_MAX_PAGES = Number(process.env.TTS_AFF_MAX_PAGES || 80); // 80 หน้า x 100 = 8,000 ออเดอร์ต่อช่วง
+const money = (m) => (m && m.amount != null ? Number(m.amount) : 0);
+const ymdBangkok = (unix) => new Date((unix + 25200) * 1000).toISOString().slice(0, 10);
+
+async function affiliateOrders(start, end, cipher) {
+  const ge = Math.floor(new Date(`${start}T00:00:00+07:00`).getTime() / 1000);
+  const lt = Math.floor(new Date(`${end}T00:00:00+07:00`).getTime() / 1000) + 86400;
+  const orders = [];
+  let pageToken = "", pages = 0, total = null;
+  do {
+    const query = { page_size: "100" };
+    if (pageToken) query.page_token = pageToken;
+    const r = await call("/affiliate_seller/202410/orders/search", { method: "POST", query, body: { create_time_ge: ge, create_time_lt: lt }, shopCipher: cipher });
+    const d = r.data || {};
+    if (total === null) total = d.total_count ?? null;
+    for (const o of d.orders || []) orders.push(o);
+    pageToken = d.next_page_token || "";
+    pages += 1;
+  } while (pageToken && pages < AFF_MAX_PAGES);
+  return { orders, total_count: total, pages, truncated: !!pageToken };
+}
+
+// รวมยอดจากออเดอร์จริง — ตัวชี้วัดใดที่ API ไม่ได้ให้ จะเป็น null (ไม่เดา ไม่ใส่ 0)
+function aggregateAffiliate(orders) {
+  const byDay = new Map(), byCreator = new Map(), byProduct = new Map(), byContent = new Map(), byStatus = new Map();
+  let gmv = 0, commission = 0, adsCommission = 0, items = 0, refundGmv = 0, skuLines = 0, multiQtyLines = 0;
+  const creators = new Set();
+  for (const o of orders) {
+    const day = ymdBangkok(o.create_time);
+    let orderGmv = 0, orderComm = 0, orderItems = 0;
+    for (const s of o.skus || []) {
+      const qty = Number(s.quantity || 0);
+      const line = money(s.price);           // ยอดขายของบรรทัดนี้ (สกุลตาม currency ที่ API ส่งมา)
+      const comm = money(s.estimated_paid_commission);
+      const ads = money(s.estimated_paid_shop_ads_commission);
+      const returned = String(s.fully_return || "").toLowerCase() === "yes";
+      skuLines += 1; if (qty > 1) multiQtyLines += 1;
+      orderGmv += line; orderComm += comm; orderItems += qty;
+      adsCommission += ads;
+      if (returned) refundGmv += line;
+      if (s.creator_username) creators.add(s.creator_username);
+      const ck = s.creator_username || "(ไม่ระบุ)";
+      const c = byCreator.get(ck) || { creator: ck, gmv: 0, commission: 0, items: 0, orders: new Set() };
+      c.gmv += line; c.commission += comm; c.items += qty; c.orders.add(o.id); byCreator.set(ck, c);
+      const pk = s.product_id || "(ไม่ระบุ)";
+      const pr = byProduct.get(pk) || { product_id: pk, gmv: 0, commission: 0, items: 0, orders: new Set() };
+      pr.gmv += line; pr.commission += comm; pr.items += qty; pr.orders.add(o.id); byProduct.set(pk, pr);
+      const tk2 = s.content_type || "(ไม่ระบุ)";
+      const t = byContent.get(tk2) || { content_type: tk2, gmv: 0, commission: 0, items: 0 };
+      t.gmv += line; t.commission += comm; t.items += qty; byContent.set(tk2, t);
+      const sk = s.settlement_status || "(ไม่ระบุ)";
+      byStatus.set(sk, (byStatus.get(sk) || 0) + 1);
+    }
+    gmv += orderGmv; commission += orderComm; items += orderItems;
+    const dd = byDay.get(day) || { date: day, affiliate_gmv: 0, estimated_commission: 0, affiliate_items_sold_cnt: 0, orders: 0 };
+    dd.affiliate_gmv += orderGmv; dd.estimated_commission += orderComm; dd.affiliate_items_sold_cnt += orderItems; dd.orders += 1;
+    byDay.set(day, dd);
+  }
+  const shrink = (m) => [...m.values()].map((x) => ({ ...x, orders: x.orders instanceof Set ? x.orders.size : x.orders })).sort((a, b) => b.gmv - a.gmv);
+  return {
+    totals: {
+      affiliate_gmv: gmv,
+      estimated_commission: commission,
+      estimated_shop_ads_commission: adsCommission,
+      affiliate_items_sold_cnt: items,
+      affiliate_orders_cnt: orders.length,
+      affiliate_refunded_gmv: refundGmv,
+      distinct_sales_creators_cnt: creators.size,
+      average_order_value: orders.length ? gmv / orders.length : null,
+      // ตัวชี้วัดที่ Partner API ไม่ได้ให้ — ต้องเป็น null เพื่อไม่ให้หน้าเว็บแสดงเลขที่ไม่มีจริง
+      distinct_affiliate_buyers_cnt: null, distinct_promoting_creators_cnt: null,
+      affiliate_video_cnt: null, affiliate_live_cnt: null,
+      product_ctr: null, click_to_order_rate: null, samples_shipped_cnt: null,
+    },
+    daily: [...byDay.values()].sort((a, b) => (a.date < b.date ? -1 : 1)),
+    creators: shrink(byCreator).slice(0, 200),
+    products: shrink(byProduct).slice(0, 200),
+    by_content_type: [...byContent.values()].sort((a, b) => b.gmv - a.gmv),
+    settlement_status: [...byStatus.entries()].map(([status, count]) => ({ status, count })).sort((a, b) => b.count - a.count),
+    sku_lines: skuLines, multi_quantity_lines: multiQtyLines,
+  };
+}
+
+async function affiliateRangePartner(start, end) {
+  const cipher = (await shops())[0]?.cipher;
+  if (!cipher) throw new PartnerError("ไม่พบร้านที่อนุญาตแล้ว", "/authorization/202309/shops", 0, null);
+  const { orders, total_count, pages, truncated } = await affiliateOrders(start, end, cipher);
+  const agg = aggregateAffiliate(orders);
+  return { range: { start, end }, source: "partner_api", api_total_count: total_count, fetched_orders: orders.length, pages, truncated, ...agg };
+}
+
+async function affiliateWithCompare(p) {
+  if (!p.start || !p.end) throw new PartnerError("ต้องระบุ start และ end (YYYY-MM-DD)", "-", 0, null);
+  const current = await affiliateRangePartner(p.start, p.end);
+  let compare = null, diff = null;
+  if (p.cmp_start && p.cmp_end) {
+    compare = await affiliateRangePartner(p.cmp_start, p.cmp_end);
+    diff = {};
+    for (const k of Object.keys(current.totals)) {
+      const a = current.totals[k], b = compare.totals[k];
+      diff[k] = a == null || b == null || !b ? null : (a - b) / b;
+    }
+  }
+  return { current, compare, diff };
 }
 
 async function handlePartner(action, p) {
@@ -239,6 +351,7 @@ async function handlePartner(action, p) {
     case "ttsRefresh": return await refresh();
     case "ttsShops": return { shops: await shops() };
     case "ttsTest": return await selfTest();
+    case "ttsAffiliate": return await affiliateWithCompare(p);
     default: return null;
   }
 }
@@ -248,4 +361,6 @@ function refreshTokenForDisplay() {
   return t ? (t.refresh_token || "") : "";
 }
 
-module.exports = { handlePartner, exchangeCode, refreshTokenForDisplay, PartnerError };
+const partnerConfigured = () => !!(APP_KEY && APP_SECRET);
+
+module.exports = { handlePartner, exchangeCode, refreshTokenForDisplay, affiliateWithCompare, partnerConfigured, PartnerError };
