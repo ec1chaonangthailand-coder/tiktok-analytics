@@ -4,6 +4,21 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+// ---------- โหลดไฟล์ .env (ถ้ามี) — ใช้ตอนรันในเครื่อง; บน Render ใช้ Environment Variables ----------
+try {
+  const envFiles = [path.join(__dirname, "..", ".env"), path.join(__dirname, "..", "tiktok-api-keys.txt")];
+  for (const envFile of envFiles) {
+    if (!fs.existsSync(envFile)) continue;
+    for (const line of fs.readFileSync(envFile, "utf8").split(/\r?\n/)) {
+      const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+      if (!m || line.trim().startsWith("#")) continue;
+      let v = m[2].trim();
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+      if (v !== "" && !process.env[m[1]]) process.env[m[1]] = v; // ค่าว่างไม่นับ (กันไฟล์ .env เปล่าบังไฟล์อื่น)
+    }
+  }
+} catch { /* ไม่มี .env ก็ข้ามไป */ }
+
 const { handle } = require("./tiktok");
 
 // ---------- ล็อกอินเข้าเว็บ (เปิดเมื่อตั้ง APP_PASSWORD) ----------
@@ -49,6 +64,18 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, APP_PASSWORD ? loginPage() : "ไม่ได้ตั้งรหัสผ่าน (APP_PASSWORD) — เข้าใช้ได้เลย", MIME[".html"]);
     }
     if (url.pathname === "/logout") { res.writeHead(302, { "set-cookie": "sa_auth=; Path=/; Max-Age=0", location: "/login" }); return res.end(); }
+    // ---- OAuth callback ของ TikTok Shop Partner API ----
+    if (url.pathname === "/auth/callback") {
+      const code = url.searchParams.get("code") || url.searchParams.get("auth_code") || "";
+      const page = (title, detail) => `<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><link rel="stylesheet" href="/app.css"></head><body><main style="max-width:640px;margin:60px auto"><div class="card"><h2>${title}</h2><pre style="white-space:pre-wrap;word-break:break-word">${detail}</pre><p><a href="/">กลับหน้าแอป</a></p></div></main></body></html>`;
+      if (!code) return send(res, 400, page("ไม่พบ auth_code", "TikTok ไม่ได้ส่งพารามิเตอร์ code กลับมา"), MIME[".html"]);
+      try {
+        const r = await require("./partner").exchangeCode(code);
+        return send(res, 200, page("เชื่อมต่อ Partner API สำเร็จ", JSON.stringify(r, null, 2)), MIME[".html"]);
+      } catch (e) {
+        return send(res, 502, page("แลก token ไม่สำเร็จ", `${e.message}\nendpoint: ${e.endpoint || "-"}\nhttp: ${e.http_status || "-"}\ncode: ${e.code ?? "-"}`), MIME[".html"]);
+      }
+    }
     if (!isAuthed(req) && url.pathname !== "/app.css") {
       if (url.pathname.startsWith("/api")) return send(res, 401, { ok: false, error: "กรุณาเข้าสู่ระบบ", app_login: true });
       res.writeHead(302, { location: "/login" }); return res.end();
@@ -57,7 +84,11 @@ const server = http.createServer(async (req, res) => {
       const p = req.method === "POST" ? await readBody(req) : Object.fromEntries(url.searchParams);
       const action = p.action || "status";
       try {
-        const data = await handle(action, p);
+        let data;
+        if (String(action).startsWith("tts")) {
+          data = await require("./partner").handlePartner(action, p);
+          if (data === null) throw Object.assign(new Error(`unknown action: ${action}`), { status: 400 });
+        } else data = await handle(action, p);
         return send(res, 200, { ok: true, action, fetched_at: Math.floor(Date.now() / 1000), data });
       } catch (e) {
         const status = e.session_expired ? 401 : (e.status || 502);
